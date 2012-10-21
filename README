@@ -1,4 +1,4 @@
-# 1. Install under ubuntu:
+#1. Install under ubuntu:
 Install python: 
 
     sudo apt-get install python
@@ -27,7 +27,7 @@ Create desktop quickstart:
     # update the path in goagent.desktop
     sudo chmod 777 /usr/share/applications/goagent.desktop
 
-# 2 Install under windows
+#2 Install under windows
 ...
 
 Enjoy it!
