@@ -1,7 +1,9 @@
-1. Install under ubuntu:
+Install under ubuntu:
+=====================
+
 Install python: 
 
-    sudo apt-get install python
+    `sudo apt-get install python`
 
 Get GAE for linux : 
 
@@ -27,7 +29,8 @@ Create desktop quickstart:
     # update the path in goagent.desktop
     sudo chmod 777 /usr/share/applications/goagent.desktop
 
-2 Install under windows
+Install under windows
+=====================
 ...
 
 Enjoy it!
