@@ -6,5 +6,13 @@ threadsafe: true
 
 handlers:
 - url: /fetch\.py
-  script: wsgi.app
+  script: wsgi.gae_app
   secure: optional
+  
+- url: /2
+  script: wsgi.gae_app_ex
+  secure: optional
+
+- url: /robots.txt
+  static_files: robots.txt
+  upload: robots.txt

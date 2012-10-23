@@ -3,10 +3,24 @@
 # Contributor:
 #      Phus Lu        <phus.lu@gmail.com>
 
-__version__ = '2.0.5'
+__version__ = '2.0.12'
 __password__ = ''
+__hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 
-import sys, os, re, time, struct, zlib, binascii, logging, httplib, urlparse, base64, cStringIO, wsgiref.headers
+import sys
+import os
+import re
+import time
+import struct
+import zlib
+import binascii
+import logging
+import httplib
+import urlparse
+import base64
+import cStringIO
+import hashlib
+import errno
 try:
     from google.appengine.api import urlfetch
     from google.appengine.runtime import apiproxy_errors
@@ -22,23 +36,9 @@ except:
     socket = None
 
 FetchMax = 2
-FetchMaxSize = 1024*1024
+FetchMaxSize = 1024*1024*4
 DeflateMaxSize = 1024*1024*4
 Deadline = 60
-
-def io_copy(source, dest):
-    try:
-        io_read  = getattr(source, 'read', None) or getattr(source, 'recv')
-        io_write = getattr(dest, 'write', None) or getattr(dest, 'sendall')
-        while 1:
-            data = io_read(8192)
-            if not data:
-                break
-            io_write(data)
-    except Exception as e:
-        logging.exception('io_copy(source=%r, dest=%r) error: %s', source, dest, e)
-    finally:
-        pass
 
 def httplib_request(method, url, body=None, headers={}, timeout=None):
     scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
@@ -51,51 +51,6 @@ def httplib_request(method, url, body=None, headers={}, timeout=None):
     conn.request(method, path, body=body, headers=headers)
     response = conn.getresponse()
     return response
-
-def httplib_normalize_headers(response_headers, skip_headers=[]):
-    """return (headers, content_encoding, transfer_encoding)"""
-    headers = []
-    for keyword, value in response_headers:
-        keyword = keyword.title()
-        if keyword in skip_headers:
-            continue
-        if keyword == 'Connection':
-            headers.append(('Connection', 'close'))
-        elif keyword != 'Set-Cookie':
-            headers.append((keyword, value))
-        else:
-            scs = value.split(', ')
-            cookies = []
-            i = -1
-            for sc in scs:
-                if re.match(r'[^ =]+ ', sc):
-                    try:
-                        cookies[i] = '%s, %s' % (cookies[i], sc)
-                    except IndexError:
-                        pass
-                else:
-                    cookies.append(sc)
-                    i += 1
-            headers += [('Set-Cookie', x) for x in cookies]
-    return headers
-
-def encode_request(headers, **kwargs):
-    if hasattr(headers, 'items'):
-        headers = headers.items()
-    data = ''.join('%s: %s\r\n' % (k, v) for k, v in headers) + ''.join('X-Goa-%s: %s\r\n' % (k.title(), v) for k, v in kwargs.iteritems())
-    return base64.b64encode(zlib.compress(data)).rstrip()
-
-def decode_request(request):
-    data     = zlib.decompress(base64.b64decode(request))
-    headers  = []
-    kwargs   = {}
-    for line in data.splitlines():
-        keyword, _, value = line.partition(':')
-        if keyword.startswith('X-Goa-'):
-            kwargs[keyword[6:].lower()] = value.strip()
-        else:
-            headers.append((keyword.title(), value.strip()))
-    return headers, kwargs
 
 def paas_application(environ, start_response):
     try:
@@ -138,7 +93,7 @@ def paas_application(environ, start_response):
         except httplib.HTTPException as e:
             raise
 
-def socket_forward(local, remote, timeout=60, tick=2, bufsize=8192, maxping=None, maxpong=None, idlecall=None):
+def socket_forward(local, remote, timeout=60, tick=2, bufsize=8192, maxping=None, maxpong=None, idlecall=None, trans=''):
     timecount = timeout
     try:
         while 1:
@@ -151,6 +106,8 @@ def socket_forward(local, remote, timeout=60, tick=2, bufsize=8192, maxping=None
             if ins:
                 for sock in ins:
                     data = sock.recv(bufsize)
+                    if trans:
+                        data = data.translate(trans)
                     if data:
                         if sock is local:
                             remote.sendall(data)
@@ -175,53 +132,75 @@ def socket_forward(local, remote, timeout=60, tick=2, bufsize=8192, maxping=None
         if idlecall:
             idlecall()
 
-def paas_socks5(environ, start_response):
-    wsgi_input = environ['wsgi.input']
-    sock = None
-    rfile = None
-    if hasattr(wsgi_input, 'rfile'):
-        sock = wsgi_input.rfile._sock
-        rfile = wsgi_input.rfile
-    elif hasattr(wsgi_input, '_sock'):
-        sock = wsgi_input._sock
-    elif hasattr(wsgi_input, 'fileno'):
-        sock = socket.fromfd(wsgi_input.fileno())
-    if not sock:
-        raise RuntimeError('cannot extract socket from wsgi_input=%r' % wsgi_input)
-    # 1. Version
-    if not rfile:
-        rfile = sock.makefile('rb', -1)
-    rfile.read(ord(rfile.read(2)[-1]))
-    sock.send(b'\x05\x00');
-    # 2. Request
-    data = rfile.read(4)
-    mode = ord(data[1])
-    addrtype = ord(data[3])
-    if addrtype == 1:       # IPv4
-        addr = socket.inet_ntoa(rfile.read(4))
-    elif addrtype == 3:     # Domain name
-        addr = rfile.read(ord(sock.recv(1)[0]))
-    port = struct.unpack('>H', rfile.read(2))
-    reply = b'\x05\x00\x00\x01'
+def socks5_handler(sock, address):
+    bufsize = 8192
+    rfile = sock.makefile('rb', bufsize)
+    wfile = sock.makefile('wb', 0)
+    remote_addr, remote_port = address
+    MessageClass = dict
     try:
-        logging.info('paas_socks5 mode=%r', mode)
-        if mode == 1:  # 1. TCP Connect
-            remote = socket.create_connection((addr, port[0]))
-            logging.info('TCP Connect to %s:%s', addr, port[0])
-            local = remote.getsockname()
-            reply += socket.inet_aton(local[0]) + struct.pack(">H", local[1])
-        else:
-            reply = b'\x05\x07\x00\x01' # Command not supported
-    except socket.error:
-        # Connection refused
-        reply = '\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00'
-    sock.send(reply)
-    # 3. Transfering
-    if reply[1] == '\x00':  # Success
-        if mode == 1:    # 1. Tcp connect
-            socket_forward(sock, remote)
+        line = rfile.readline(bufsize)
+        if not line:
+            raise socket.error('empty line')
+        method, path, version = line.rstrip().split(' ', 2)
+        headers = MessageClass()
+        while 1:
+            line = rfile.readline(bufsize)
+            if not line or line == '\r\n':
+                break
+            keyword, _, value = line.partition(':')
+            keyword = keyword.title()
+            value = value.strip()
+            headers[keyword] = value
+        logging.info('%s:%s "%s %s %s" - -', remote_addr, remote_port, method, path, version)
+        if headers.get('Connection', '').lower() != 'upgrade':
+            logging.error('%s:%s Connection(%s) != "upgrade"', remote_addr, remote_port, headers.get('Connection'))
+            return
 
-def send_response(start_response, status, headers, content, content_type='image/gif'):
+        #wfile.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n')
+
+        transtable = ''.join(chr(x%256) for x in xrange(-128, 128))
+        rfile_read  = lambda x:rfile.read(x).translate(transtable)
+        wfile_write = lambda x:wfile.write(x.translate(transtable))
+
+        rfile_read(ord(rfile_read(2)[-1]))
+        wfile_write(b'\x05\x00');
+        # 2. Request
+        data = rfile_read(4)
+        mode = ord(data[1])
+        addrtype = ord(data[3])
+        if addrtype == 1:       # IPv4
+            addr = socket.inet_ntoa(rfile_read(4))
+        elif addrtype == 3:     # Domain name
+            addr = rfile_read(ord(rfile_read(1)[0]))
+        port = struct.unpack('>H',rfile_read(2))
+        reply = b'\x05\x00\x00\x01'
+        try:
+            logging.info('%s:%s socks5 mode=%r', remote_addr, remote_port, mode)
+            if mode == 1:  # 1. TCP Connect
+                remote = socket.create_connection((addr, port[0]))
+                logging.info('%s:%s TCP Connect to %s:%s', remote_addr, remote_port, addr, port[0])
+                local = remote.getsockname()
+                reply += socket.inet_aton(local[0]) + struct.pack(">H", local[1])
+            else:
+                reply = b'\x05\x07\x00\x01' # Command not supported
+        except socket.error:
+            # Connection refused
+            reply = '\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00'
+        wfile_write(reply)
+        # 3. Transfering
+        if reply[1] == '\x00':  # Success
+            if mode == 1:    # 1. Tcp connect
+                socket_forward(sock, remote, trans=transtable)
+    except socket.error as e:
+        if e[0] not in (10053, errno.EPIPE, 'empty line'):
+            raise
+    finally:
+        rfile.close()
+        wfile.close()
+        sock.close()
+
+def gae_response(start_response, status, headers, content, content_type='image/gif'):
     headers['Content-Length'] = str(len(content))
     strheaders = '&'.join('%s=%s' % (k, binascii.b2a_hex(v)) for k, v in headers.iteritems() if v)
     #logging.debug('response status=%s, headers=%s, content length=%d', status, headers, len(content))
@@ -232,12 +211,15 @@ def send_response(start_response, status, headers, content, content_type='image/
     start_response('200 OK', [('Content-type', content_type)])
     return [data]
 
-def send_notify(start_response, method, url, status, content):
+def gae_notify(start_response, method, url, status, content):
     logging.warning('%r Failed: url=%r, status=%r', method, url, status)
     content = '<h2>Python Server Fetch Info</h2><hr noshade="noshade"><p>%s %r</p><p>Return Code: %d</p><p>Message: %s</p>' % (method, url, status, content)
-    send_response(start_response, status, {'content-type':'text/html'}, content)
+    return gae_response(start_response, status, {'content-type':'text/html'}, content)
 
-def gae_post(environ, start_response):
+def gae_app(environ, start_response):
+    if environ['REQUEST_METHOD'] == 'GET':
+        return gae_get(environ, start_response)
+
     data = zlib.decompress(environ['wsgi.input'].read(int(environ['CONTENT_LENGTH'])))
     request = dict((k,binascii.a2b_hex(v)) for k, _, v in (x.partition('=') for x in data.split('&')))
     #logging.debug('post() get fetch request %s', request)
@@ -247,11 +229,14 @@ def gae_post(environ, start_response):
     payload = request['payload']
 
     if __password__ and __password__ != request.get('password', ''):
-        return send_notify(start_response, method, url, 403, 'Wrong password.')
+        return gae_notify(start_response, method, url, 403, 'Wrong password.')
+
+    if __hostsdeny__ and urlparse.urlparse(url).netloc.endswith(__hostsdeny__):
+        return gae_notify(start_response, method, url, 403, 'Hosts Deny: url=%r' % url)
 
     fetchmethod = getattr(urlfetch, method, '')
     if not fetchmethod:
-        return send_notify(start_response, method, url, 501, 'Invalid Method')
+        return gae_notify(start_response, method, url, 501, 'Invalid Method')
 
     deadline = Deadline
 
@@ -274,42 +259,22 @@ def gae_post(environ, start_response):
             logging.error('DownloadError(deadline=%s, url=%r)', deadline, url)
             time.sleep(1)
         except urlfetch.InvalidURLError as e:
-            return send_notify(start_response, method, url, 501, 'Invalid URL: %s' % e)
+            return gae_notify(start_response, method, url, 501, 'Invalid URL: %s' % e)
         except urlfetch.ResponseTooLargeError as e:
-            response = e.response
-            logging.error('DownloadError(deadline=%s, url=%r) response(%s)', deadline, url, response and response.headers)
-            if response and response.headers.get('content-length'):
-                response.status_code = 206
-                response.headers['accept-ranges']  = 'bytes'
-                response.headers['content-range']  = 'bytes 0-%d/%s' % (len(response.content)-1, response.headers['content-length'])
-                response.headers['content-length'] = len(response.content)
-                break
+            logging.error('ResponseTooLargeError(deadline=%s, url=%r)', deadline, url)
+            range = request.pop('range', None)
+            if range:
+                headers['Range'] = range
             else:
-                headers['Range'] = 'bytes=0-%d' % FetchMaxSize
+                errors.append('ResponseTooLargeError %s(deadline=%s)' % (e, deadline))
+                return send_notify(start_response, method, url, 500, 'Python Server: Urlfetch error: %s' % errors)
+            deadline = Deadline * 2
         except Exception as e:
             errors.append('Exception %s(deadline=%s)' % (e, deadline))
     else:
-        return send_notify(start_response, method, url, 500, 'Python Server: Urlfetch error: %s' % errors)
+        return gae_notify(start_response, method, url, 500, 'Python Server: Urlfetch error: %s' % errors)
 
-    headers = response.headers
-    if 'set-cookie' in headers:
-        scs = headers['set-cookie'].split(', ')
-        cookies = []
-        i = -1
-        for sc in scs:
-            if re.match(r'[^ =]+ ', sc):
-                try:
-                    cookies[i] = '%s, %s' % (cookies[i], sc)
-                except IndexError:
-                    pass
-            else:
-                cookies.append(sc)
-                i += 1
-        headers['set-cookie'] = '\r\nSet-Cookie: '.join(cookies)
-    if 'content-length' not in headers:
-        headers['content-length'] = str(len(response.content))
-    headers['connection'] = 'close'
-    return send_response(start_response, response.status_code, headers, response.content)
+    return gae_response(start_response, response.status_code, headers, response.content)
 
 def gae_error_html(**kwargs):
     GAE_ERROR_TEMPLATE = '''
@@ -346,27 +311,53 @@ A.u:link {color: green}
     return GAE_ERROR_TEMPLATE
 
 
-def gae_post_ex(environ, start_response):
-    headers, kwargs = decode_request(environ['HTTP_COOKIE'])
+def gae_app_ex(environ, start_response):
+    if environ['REQUEST_METHOD'] == 'GET':
+        yield gae_get(environ, start_response)
+        raise StopIteration
 
-    method = kwargs['method']
-    url    = kwargs['url']
+    # undeflate = lambda x:zlib.decompress(x, -15)
+    wsgi_input = environ['wsgi.input']
+    data = wsgi_input.read(2)
+    metadata_length = struct.unpack('!h', data)[0]
+    metadata = wsgi_input.read(metadata_length)
+
+    metadata = zlib.decompress(metadata, -15)
+    headers  = dict(x.split(':', 1) for x in metadata.splitlines() if x)
+    method   = headers.pop('G-Method')
+    url      = headers.pop('G-Url')
+
+    kwargs   = {}
+    any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
 
     #logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, url, 'HTTP/1.1')
+    #logging.info('request headers=%s', headers)
 
     if __password__ and __password__ != kwargs.get('password', ''):
         start_response('403 Forbidden', [('Content-Type', 'text/html')])
-        return [gae_error_html(errno='403', error='Wrong password.', description='GoAgent proxy.ini password is wrong!')]
+        yield gae_error_html(errno='403', error='Wrong password.', description='GoAgent proxy.ini password is wrong!')
+        raise StopIteration
+
+    if __hostsdeny__ and urlparse.urlparse(url).netloc.endswith(__hostsdeny__):
+        start_response('403 Forbidden', [('Content-Type', 'text/html')])
+        yield gae_error_html(errno='403', error='Hosts Deny', description='url=%r' % url)
+        raise StopIteration
 
     fetchmethod = getattr(urlfetch, method, '')
     if not fetchmethod:
         start_response('501 Unsupported', [('Content-Type', 'text/html')])
-        return [gae_error_html(errno='501', error=('Invalid Method: '+str(method)), description='Unsupported Method')]
+        yield gae_error_html(errno='501', error=('Invalid Method: '+str(method)), description='Unsupported Method')
+        raise StopIteration
 
     deadline = Deadline
     headers = dict(headers)
     headers['Connection'] = 'close'
     payload = environ['wsgi.input'].read() if 'Content-Length' in headers else None
+    if 'Content-Encoding' in headers:
+        if headers['Content-Encoding'] == 'deflate':
+            payload = zlib.decompress(payload, -15)
+            headers['Content-Length'] = str(len(payload))
+            del headers['Content-Encoding']
 
     accept_encoding = headers.get('Accept-Encoding', '')
 
@@ -376,35 +367,28 @@ def gae_post_ex(environ, start_response):
             response = urlfetch.fetch(url, payload, fetchmethod, headers, allow_truncated=False, follow_redirects=False, deadline=deadline, validate_certificate=False)
             break
         except apiproxy_errors.OverQuotaError as e:
-            time.sleep(4)
+            time.sleep(5)
         except urlfetch.DeadlineExceededError as e:
-            errors.append('DeadlineExceededError %s(deadline=%s)' % (e, deadline))
+            errors.append('%r, deadline=%s' % (e, deadline))
             logging.error('DeadlineExceededError(deadline=%s, url=%r)', deadline, url)
             time.sleep(1)
             deadline = Deadline * 2
         except urlfetch.DownloadError as e:
-            errors.append('DownloadError %s(deadline=%s)' % (e, deadline))
+            errors.append('%r, deadline=%s' % (e, deadline))
             logging.error('DownloadError(deadline=%s, url=%r)', deadline, url)
             time.sleep(1)
             deadline = Deadline * 2
         except urlfetch.ResponseTooLargeError as e:
             response = e.response
-            logging.error('ResponseTooLargeError(deadline=%s, url=%r) response(%s)', deadline, url, response and response.headers)
-            if response and response.headers.get('content-length'):
-                response.status_code = 206
-                response.headers['accept-ranges']  = 'bytes'
-                response.headers['content-range']  = 'bytes 0-%d/%s' % (len(response.content)-1, response.headers['content-length'])
-                response.headers['content-length'] = len(response.content)
-                break
+            logging.error('ResponseTooLargeError(deadline=%s, url=%r) response(%r)', deadline, url, response)
+            m = re.search(r'=\s*(\d+)-', headers.get('Range') or headers.get('range') or '')
+            if m is None:
+                headers['Range'] = 'bytes=0-%d' % int(kwargs.get('fetchmaxsize', FetchMaxSize))
             else:
-                m = re.search(r'=\s*(\d+)-', headers.get('Range') or headers.get('range') or '')
-                if m is None:
-                    headers['Range'] = 'bytes=0-%d' % FetchMaxSize
-                else:
-                    headers.pop('Range', '')
-                    headers.pop('range', '')
-                    start = int(m.group(1))
-                    headers['Range'] = 'bytes=%s-%d' % (start, start+FetchMaxSize)
+                headers.pop('Range', '')
+                headers.pop('range', '')
+                start = int(m.group(1))
+                headers['Range'] = 'bytes=%s-%d' % (start, start+int(kwargs.get('fetchmaxsize', FetchMaxSize)))
             deadline = Deadline * 2
         except Exception as e:
             errors.append(str(e))
@@ -412,7 +396,8 @@ def gae_post_ex(environ, start_response):
                 deadline = Deadline * 2
     else:
         start_response('500 Internal Server Error', [('Content-Type', 'text/html')])
-        return [gae_error_html(errno='502', error=('Python Urlfetch Error: ' + str(method)), description=str(errors))]
+        yield gae_error_html(errno='502', error=('Python Urlfetch Error: ' + str(method)), description='<br />\n'.join(errors) or 'UNKOWN')
+        raise StopIteration
 
     #logging.debug('url=%r response.status_code=%r response.headers=%r response.content[:1024]=%r', url, response.status_code, dict(response.headers), response.content[:1024])
 
@@ -431,51 +416,40 @@ def gae_post_ex(environ, start_response):
             dataio.write(struct.pack('<LL', zlib.crc32(data)&0xFFFFFFFFL, len(data)&0xFFFFFFFFL))
             data = dataio.getvalue()
     response.headers['Content-Length'] = str(len(data))
-    start_response('200 OK', [('Content-Type', 'image/gif'), ('Set-Cookie', encode_request(response.headers, status=str(response.status_code)))])
-    return [data]
+    response_headers = zlib.compress('\n'.join('%s:%s'%(k.title(),v) for k, v in response.headers.items() if not k.startswith('x-google-')))[2:-4]
+    start_response('200 OK', [('Content-Type', 'image/gif')])
+    yield struct.pack('!hh', int(response.status_code), len(response_headers))+response_headers
+    yield data
 
 def gae_get(environ, start_response):
+    if '204' in environ['QUERY_STRING']:
+        start_response('204 No Content', [])
+        return ''
     timestamp = long(os.environ['CURRENT_VERSION_ID'].split('.')[1])/pow(2,28)
     ctime = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(timestamp+8*3600))
     html = u'GoAgent Python Server %s \u5df2\u7ecf\u5728\u5de5\u4f5c\u4e86\uff0c\u90e8\u7f72\u65f6\u95f4 %s\n' % (__version__, ctime)
     start_response('200 OK', [('Content-Type', 'text/plain; charset=utf-8')])
     return [html.encode('utf8')]
 
-def app(environ, start_response):
-    if urlfetch and environ['REQUEST_METHOD'] == 'POST':
-        if environ.get('HTTP_COOKIE'):
-            return gae_post_ex(environ, start_response)
-        else:
-            return gae_post(environ, start_response)
-    elif not urlfetch:
-        if environ['PATH_INFO'] == '/socks5':
-            return paas_socks5(environ, start_response)
-        else:
-            return paas_application(environ, start_response)
-    else:
-        return gae_get(environ, start_response)
-
+app = paas_application
 application = app if sae is None else sae.create_wsgi_app(app)
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s - - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
-    import gevent, gevent.pywsgi, gevent.monkey
+    import gevent, gevent.server, gevent.wsgi, gevent.monkey, getopt
     gevent.monkey.patch_all(dns=gevent.version_info[0]>=1)
-    def read_requestline(self):
-        line = self.rfile.readline(8192)
-        while line == '\r\n':
-            line = self.rfile.readline(8192)
-        return line
-    gevent.pywsgi.WSGIHandler.read_requestline = read_requestline
-    host, _, port = sys.argv[1].rpartition(':') if len(sys.argv) == 2 else ('', ':', 443)
-    if '-ssl' in sys.argv[1:]:
-        ssl_args = dict(certfile=os.path.splitext(__file__)[0]+'.pem')
-    else:
-        ssl_args = dict()
-    server = gevent.pywsgi.WSGIServer((host, int(port)), application, log=None, **ssl_args)
-    server.environ.pop('SERVER_SOFTWARE')
-    logging.info('serving %s://%s:%s/wsgi.py', 'https' if ssl_args else 'http', server.address[0] or '0.0.0.0', server.address[1])
-    server.serve_forever()
 
+    options = dict(getopt.getopt(sys.argv[1:], 'l:p:a:')[0])
+    host = options.get('-l', '0.0.0.0')
+    port = options.get('-p', '23')
+    app  = options.get('-a', 'socks5')
+
+    if app == 'socks5':
+        server = gevent.server.StreamServer((host, int(port)), socks5_handler)
+    else:
+        server = gevent.wsgi.WSGIServer((host, int(port)), paas_application)
+
+    logging.info('serving %s at http://%s:%s/', app.upper(), server.address[0], server.address[1])
+    server.serve_forever()
 
 
