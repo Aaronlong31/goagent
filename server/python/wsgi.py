@@ -3,7 +3,7 @@
 # Contributor:
 #      Phus Lu        <phus.lu@gmail.com>
 
-__version__ = '2.0.12'
+__version__ = '2.1.3'
 __password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 
@@ -40,58 +40,41 @@ FetchMaxSize = 1024*1024*4
 DeflateMaxSize = 1024*1024*4
 Deadline = 60
 
-def httplib_request(method, url, body=None, headers={}, timeout=None):
-    scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
-    HTTPConnection = httplib.HTTPSConnection if scheme == 'https' else httplib.HTTPConnection
-    if params:
-        path += ';' + params
-    if query:
-        path += '?' + query
-    conn = HTTPConnection(netloc, timeout=timeout)
-    conn.request(method, path, body=body, headers=headers)
-    response = conn.getresponse()
-    return response
+def error_html(errno, error, description=''):
+    ERROR_TEMPLATE = '''
+<html><head>
+<meta http-equiv="content-type" content="text/html;charset=utf-8">
+<title>{{errno}} {{error}}</title>
+<style><!--
+body {font-family: arial,sans-serif}
+div.nav {margin-top: 1ex}
+div.nav A {font-size: 10pt; font-family: arial,sans-serif}
+span.nav {font-size: 10pt; font-family: arial,sans-serif; font-weight: bold}
+div.nav A,span.big {font-size: 12pt; color: #0000cc}
+div.nav A {font-size: 10pt; color: black}
+A.l:link {color: #6f6f6f}
+A.u:link {color: green}
+//--></style>
 
-def paas_application(environ, start_response):
-    try:
-        headers, kwargs = decode_request(environ['HTTP_COOKIE'])
-    except Exception as e:
-        logging.exception("decode_request(environ['HTTP_COOKIE']=%r) failed: %s", environ.get('HTTP_COOKIE'), e)
-        raise
+</head>
+<body text=#000000 bgcolor=#ffffff>
+<table border=0 cellpadding=2 cellspacing=0 width=100%>
+<tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Error</b></td></tr>
+<tr><td>&nbsp;</td></tr></table>
+<blockquote>
+<H1>{{error}}</H1>
+{{description}}
 
-    if __password__ and __password__ != kwargs.get('password'):
-        url = 'https://goa%d%s' % (int(time.time()*100), environ['HTTP_HOST'])
-        response = httplib_request('GET', url, timeout=5)
-        status_line = '%s %s' % (response.status, httplib.responses.get(response.status, 'OK'))
-        start_response(status_line, response.getheaders())
-        yield response.read()
-        raise StopIteration
-
-    method  = kwargs['method']
-    url     = kwargs['url']
-    timeout = Deadline
-
-    logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, url, 'HTTP/1.1')
-
-    if method != 'CONNECT':
-        try:
-            headers = dict(headers)
-            headers['Connection'] = 'close'
-            data = environ['wsgi.input'] if int(headers.get('Content-Length',0)) else None
-            response = httplib_request(method, url, body=data, headers=headers, timeout=timeout)
-            response_headers = dict(response.getheaders())
-            response_headers['connection'] = 'close'
-            response_headers.pop('transfer-encoding', '')
-            start_response('%s OK' % response.status, response_headers.items())
-            bufsize = 8192
-            while 1:
-                data = response.read(bufsize)
-                if not data:
-                    response.close()
-                    break
-                yield data
-        except httplib.HTTPException as e:
-            raise
+<p>
+</blockquote>
+<table width=100% cellpadding=0 cellspacing=0><tr><td bgcolor=#3366cc><img alt="" width=1 height=4></td></tr></table>
+</body></html>
+'''
+    kwargs = dict(errno=errno, error=error, description=description)
+    template = ERROR_TEMPLATE
+    for keyword, value in kwargs.items():
+        template = template.replace('{{%s}}' % keyword, value)
+    return template
 
 def socket_forward(local, remote, timeout=60, tick=2, bufsize=8192, maxping=None, maxpong=None, idlecall=None, trans=''):
     timecount = timeout
@@ -200,126 +183,121 @@ def socks5_handler(sock, address):
         wfile.close()
         sock.close()
 
-def gae_response(start_response, status, headers, content, content_type='image/gif'):
-    headers['Content-Length'] = str(len(content))
-    strheaders = '&'.join('%s=%s' % (k, binascii.b2a_hex(v)) for k, v in headers.iteritems() if v)
-    #logging.debug('response status=%s, headers=%s, content length=%d', status, headers, len(content))
-    if headers.get('content-type', '').startswith(('text/', 'application/json', 'application/javascript')):
-        data = '1' + zlib.compress('%s%s%s' % (struct.pack('>3I', status, len(strheaders), len(content)), strheaders, content))
-    else:
-        data = '0%s%s%s' % (struct.pack('>3I', status, len(strheaders), len(content)), strheaders, content)
-    start_response('200 OK', [('Content-type', content_type)])
-    return [data]
-
-def gae_notify(start_response, method, url, status, content):
-    logging.warning('%r Failed: url=%r, status=%r', method, url, status)
-    content = '<h2>Python Server Fetch Info</h2><hr noshade="noshade"><p>%s %r</p><p>Return Code: %d</p><p>Message: %s</p>' % (method, url, status, content)
-    return gae_response(start_response, status, {'content-type':'text/html'}, content)
-
-def gae_app(environ, start_response):
+def paas_application(environ, start_response):
     if environ['REQUEST_METHOD'] == 'GET':
-        return gae_get(environ, start_response)
-
-    data = zlib.decompress(environ['wsgi.input'].read(int(environ['CONTENT_LENGTH'])))
-    request = dict((k,binascii.a2b_hex(v)) for k, _, v in (x.partition('=') for x in data.split('&')))
-    #logging.debug('post() get fetch request %s', request)
-
-    method = request['method']
-    url = request['url']
-    payload = request['payload']
-
-    if __password__ and __password__ != request.get('password', ''):
-        return gae_notify(start_response, method, url, 403, 'Wrong password.')
-
-    if __hostsdeny__ and urlparse.urlparse(url).netloc.endswith(__hostsdeny__):
-        return gae_notify(start_response, method, url, 403, 'Hosts Deny: url=%r' % url)
-
-    fetchmethod = getattr(urlfetch, method, '')
-    if not fetchmethod:
-        return gae_notify(start_response, method, url, 501, 'Invalid Method')
-
-    deadline = Deadline
-
-    headers = dict((k.title(),v.lstrip()) for k, _, v in (line.partition(':') for line in request['headers'].splitlines()))
-    headers['Connection'] = 'close'
-
-    errors = []
-    for i in xrange(FetchMax if 'fetchmax' not in request else int(request['fetchmax'])):
-        try:
-            response = urlfetch.fetch(url, payload, fetchmethod, headers, False, False, deadline, False)
-            break
-        except apiproxy_errors.OverQuotaError as e:
-            time.sleep(4)
-        except urlfetch.DeadlineExceededError as e:
-            errors.append('DeadlineExceededError %s(deadline=%s)' % (e, deadline))
-            logging.error('DeadlineExceededError(deadline=%s, url=%r)', deadline, url)
-            time.sleep(1)
-        except urlfetch.DownloadError as e:
-            errors.append('DownloadError %s(deadline=%s)' % (e, deadline))
-            logging.error('DownloadError(deadline=%s, url=%r)', deadline, url)
-            time.sleep(1)
-        except urlfetch.InvalidURLError as e:
-            return gae_notify(start_response, method, url, 501, 'Invalid URL: %s' % e)
-        except urlfetch.ResponseTooLargeError as e:
-            logging.error('ResponseTooLargeError(deadline=%s, url=%r)', deadline, url)
-            range = request.pop('range', None)
-            if range:
-                headers['Range'] = range
-            else:
-                errors.append('ResponseTooLargeError %s(deadline=%s)' % (e, deadline))
-                return send_notify(start_response, method, url, 500, 'Python Server: Urlfetch error: %s' % errors)
-            deadline = Deadline * 2
-        except Exception as e:
-            errors.append('Exception %s(deadline=%s)' % (e, deadline))
-    else:
-        return gae_notify(start_response, method, url, 500, 'Python Server: Urlfetch error: %s' % errors)
-
-    return gae_response(start_response, response.status_code, headers, response.content)
-
-def gae_error_html(**kwargs):
-    GAE_ERROR_TEMPLATE = '''
-<html><head>
-<meta http-equiv="content-type" content="text/html;charset=utf-8">
-<title>{{errno}} {{error}}</title>
-<style><!--
-body {font-family: arial,sans-serif}
-div.nav {margin-top: 1ex}
-div.nav A {font-size: 10pt; font-family: arial,sans-serif}
-span.nav {font-size: 10pt; font-family: arial,sans-serif; font-weight: bold}
-div.nav A,span.big {font-size: 12pt; color: #0000cc}
-div.nav A {font-size: 10pt; color: black}
-A.l:link {color: #6f6f6f}
-A.u:link {color: green}
-//--></style>
-
-</head>
-<body text=#000000 bgcolor=#ffffff>
-<table border=0 cellpadding=2 cellspacing=0 width=100%>
-<tr><td bgcolor=#3366cc><font face=arial,sans-serif color=#ffffff><b>Error</b></td></tr>
-<tr><td>&nbsp;</td></tr></table>
-<blockquote>
-<H1>{{error}}</H1>
-{{description}}
-
-<p>
-</blockquote>
-<table width=100% cellpadding=0 cellspacing=0><tr><td bgcolor=#3366cc><img alt="" width=1 height=4></td></tr></table>
-</body></html>
-'''
-    for keyword, value in kwargs.items():
-        GAE_ERROR_TEMPLATE = GAE_ERROR_TEMPLATE.replace('{{%s}}' % keyword, value)
-    return GAE_ERROR_TEMPLATE
-
-
-def gae_app_ex(environ, start_response):
-    if environ['REQUEST_METHOD'] == 'GET':
-        yield gae_get(environ, start_response)
+        start_response('302 Found', [('Location', 'https://www.google.com')])
         raise StopIteration
 
-    # undeflate = lambda x:zlib.decompress(x, -15)
+    # inflate = lambda x:zlib.decompress(x, -15)
     wsgi_input = environ['wsgi.input']
     data = wsgi_input.read(2)
-    metadata_length = struct.unpack('!h', data)[0]
+    metadata_length, = struct.unpack('!h', data)
+    metadata = wsgi_input.read(metadata_length)
+
+    metadata = zlib.decompress(metadata, -15)
+    headers  = dict(x.split(':', 1) for x in metadata.splitlines() if x)
+    method   = headers.pop('G-Method')
+    url      = headers.pop('G-Url')
+
+    kwargs   = {}
+    any(kwargs.__setitem__(x[2:].lower(), headers.pop(x)) for x in headers.keys() if x.startswith('G-'))
+
+    headers['Connection'] = 'close'
+
+    payload = environ['wsgi.input'].read() if 'Content-Length' in headers else None
+    if 'Content-Encoding' in headers:
+        if headers['Content-Encoding'] == 'deflate':
+            payload = zlib.decompress(payload, -15)
+            headers['Content-Length'] = str(len(payload))
+            del headers['Content-Encoding']
+
+    if __password__ and __password__ != kwargs.get('password'):
+        random_host = 'g%d%s' % (int(time.time()*100), environ['HTTP_HOST'])
+        conn = httplib.HTTPConnection(random_host, timeout=3)
+        conn.request('GET', '/')
+        response = conn.getresponse(True)
+        status_line = '%s %s' % (response.status, httplib.responses.get(response.status, 'OK'))
+        start_response(status_line, response.getheaders())
+        yield response.read()
+        raise StopIteration
+
+    if __hostsdeny__ and urlparse.urlparse(url).netloc.endswith(__hostsdeny__):
+        start_response('403 Forbidden', [('Content-Type', 'text/html')])
+        yield error_html('403', 'Hosts Deny', description='url=%r' % url)
+        raise StopIteration
+
+    timeout = Deadline
+
+    logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, url, 'HTTP/1.1')
+
+    if method != 'CONNECT':
+        try:
+            scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
+            HTTPConnection = httplib.HTTPSConnection if scheme == 'https' else httplib.HTTPConnection
+            if params:
+                path += ';' + params
+            if query:
+                path += '?' + query
+            conn = HTTPConnection(netloc, timeout=timeout)
+            conn.request(method, path, body=payload, headers=headers)
+            response = conn.getresponse()
+
+            need_deflate = True
+            if response.getheader('Content-Encoding') or response.getheader('Content-Type', '').startswith(('video/', 'audio/', 'image/')) or 'deflate' not in headers.get('Accept-Encoding', ''):
+                need_deflate = False
+
+            if need_deflate:
+                response.msg['Content-Encoding'] = 'deflate'
+                if 'Content-Length' in response.msg:
+                    del response.msg['Content-Length']
+            response_headers = '\n'.join('%s:%s'%(k.title(),v) for k, v in response.getheaders())
+            response_headers = zlib.compress(response_headers)[2:-4]
+
+            start_response('200 OK', [('Content-Type', 'image/gif')])
+            yield struct.pack('!hh', int(response.status), len(response_headers)) + response_headers
+
+            bufsize = 8192
+            if need_deflate:
+                compressobj = zlib.compressobj()
+                is_leadbyte = True
+                while 1:
+                    data = response.read(bufsize)
+                    if not data:
+                        break
+                    zdata = compressobj.compress(data)
+                    if zdata:
+                        if is_leadbyte:
+                            zdata = zdata[2:]
+                            is_leadbyte = False
+                        yield zdata
+                yield compressobj.flush()[:-4]
+            else:
+                while 1:
+                    data = response.read(bufsize)
+                    if not data:
+                        response.close()
+                        break
+                    yield data
+        except httplib.HTTPException as e:
+            raise
+
+def gae_application(environ, start_response):
+    if environ['REQUEST_METHOD'] == 'GET':
+        if '204' in environ['QUERY_STRING']:
+            start_response('204 No Content', [])
+            yield ''
+        else:
+            timestamp = long(os.environ['CURRENT_VERSION_ID'].split('.')[1])/pow(2,28)
+            ctime = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(timestamp+8*3600))
+            html = u'GoAgent Python Server %s \u5df2\u7ecf\u5728\u5de5\u4f5c\u4e86\uff0c\u90e8\u7f72\u65f6\u95f4 %s\n' % (__version__, ctime)
+            start_response('200 OK', [('Content-Type', 'text/plain; charset=utf-8')])
+            yield html.encode('utf8')
+        raise StopIteration
+
+    # inflate = lambda x:zlib.decompress(x, -15)
+    wsgi_input = environ['wsgi.input']
+    data = wsgi_input.read(2)
+    metadata_length, = struct.unpack('!h', data)
     metadata = wsgi_input.read(metadata_length)
 
     metadata = zlib.decompress(metadata, -15)
@@ -335,18 +313,18 @@ def gae_app_ex(environ, start_response):
 
     if __password__ and __password__ != kwargs.get('password', ''):
         start_response('403 Forbidden', [('Content-Type', 'text/html')])
-        yield gae_error_html(errno='403', error='Wrong password.', description='GoAgent proxy.ini password is wrong!')
+        yield error_html('403', 'Wrong password', description='GoAgent proxy.ini password is wrong!')
         raise StopIteration
 
     if __hostsdeny__ and urlparse.urlparse(url).netloc.endswith(__hostsdeny__):
         start_response('403 Forbidden', [('Content-Type', 'text/html')])
-        yield gae_error_html(errno='403', error='Hosts Deny', description='url=%r' % url)
+        yield error_html('403', 'Hosts Deny', description='url=%r' % url)
         raise StopIteration
 
     fetchmethod = getattr(urlfetch, method, '')
     if not fetchmethod:
         start_response('501 Unsupported', [('Content-Type', 'text/html')])
-        yield gae_error_html(errno='501', error=('Invalid Method: '+str(method)), description='Unsupported Method')
+        yield error_html('501', 'Invalid Method: %r'% method, description='Unsupported Method')
         raise StopIteration
 
     deadline = Deadline
@@ -396,7 +374,7 @@ def gae_app_ex(environ, start_response):
                 deadline = Deadline * 2
     else:
         start_response('500 Internal Server Error', [('Content-Type', 'text/html')])
-        yield gae_error_html(errno='502', error=('Python Urlfetch Error: ' + str(method)), description='<br />\n'.join(errors) or 'UNKOWN')
+        yield error_html('502', 'Python Urlfetch Error: %r' % method, description='<br />\n'.join(errors) or 'UNKOWN')
         raise StopIteration
 
     #logging.debug('url=%r response.status_code=%r response.headers=%r response.content[:1024]=%r', url, response.status_code, dict(response.headers), response.content[:1024])
@@ -421,17 +399,7 @@ def gae_app_ex(environ, start_response):
     yield struct.pack('!hh', int(response.status_code), len(response_headers))+response_headers
     yield data
 
-def gae_get(environ, start_response):
-    if '204' in environ['QUERY_STRING']:
-        start_response('204 No Content', [])
-        return ''
-    timestamp = long(os.environ['CURRENT_VERSION_ID'].split('.')[1])/pow(2,28)
-    ctime = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(timestamp+8*3600))
-    html = u'GoAgent Python Server %s \u5df2\u7ecf\u5728\u5de5\u4f5c\u4e86\uff0c\u90e8\u7f72\u65f6\u95f4 %s\n' % (__version__, ctime)
-    start_response('200 OK', [('Content-Type', 'text/plain; charset=utf-8')])
-    return [html.encode('utf8')]
-
-app = paas_application
+app = gae_application if urlfetch else paas_application
 application = app if sae is None else sae.create_wsgi_app(app)
 
 if __name__ == '__main__':
