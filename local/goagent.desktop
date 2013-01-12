@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=goagent
+Exec=/home/zhanglong/tools/google_appengine/goagent/local/proxy.py
+Icon=/home/zhanglong/tools/google_appengine/goagent/local/logo.png
+Terminal=true
+Categories=Application;Development;
+Comment=a proxy tool
